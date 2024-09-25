@@ -1,0 +1,6 @@
+ID,IP,uri,is_connected,is_trying,x,y,z
+1,192.168.50.222,PYRO:rover_server@192.168.50.222:9091
+2,192.168.50.215,PYRO:rover_server@192.168.50.216:9091
+3,192.168.50.99,PYRO:rover_server@192.168.50.251:9091
+4,192.168.50.52,PYRO:rover_server@192.168.50.140:9091
+5,192.168.50.142,PYRO:rover_server@192.168.50.141:9091

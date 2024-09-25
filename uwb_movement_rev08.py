@@ -1,0 +1,348 @@
+'''
+rev 07 - Setpoint interval at each 1 seconds, ignore intermediate
+rev 08 - Restructure database
+'''
+
+import threading
+import time
+import pylops
+import signal
+import serial
+import math
+
+import pandas as pd
+import numpy as np
+
+from datetime import datetime
+from uwb_usb import UwbUsbReader
+from HiwonderSDK import mecanum, Board
+############################################
+#Global var
+pos_x, pos_y, pos_z, timestamp = 0, 0, 0, 0
+timestamp_list, pos_x_list, pos_y_list, pos_z_list = [], [], [], []
+uwb_is_connected = False
+
+############################################
+stop_requested = False
+# Smoothing operator (Sop)
+points = np.zeros((10, 2))
+
+# Pylops 1D smoothing
+N = 10
+nsmooth = 7
+Sop = pylops.Smoothing1D(nsmooth=nsmooth, dims=[N], dtype="float32")
+chassis = mecanum.MecanumChassis()
+
+data_ready_event = threading.Event()
+##########################################################################
+def get_current_timestamp():
+    # Get the current time
+    now = datetime.now()
+
+    # Format hours, minutes, and seconds
+    time_str = now.strftime("%H%M%S")
+
+    # Get milliseconds (fraction of a second)
+    milliseconds = int(time.time() * 1000) % 1000
+
+    # Format milliseconds as three digits
+    milliseconds_str = f"{milliseconds:03}"
+
+    # Combine the time string with milliseconds
+    timestamp = f"{time_str}.{milliseconds_str}"
+    return timestamp
+##########################################################################
+def read_uwb():
+    global pos_x, pos_y, pos_z, timestamp_list, pos_x_list, pos_y_list, pos_z_list, timestamp, uwb_is_connected
+    serial_port = "/dev/ttyACM0"
+    baud_rate = 115200
+    
+    print("Thread UWB starting...")
+    reader = UwbUsbReader(serial_port)
+    # Wait a moment for the connection to be established
+    time.sleep(2)
+    print(f"Connected to {serial_port} at baud rate {baud_rate}")
+    
+    Board.setBuzzer(1)
+    time.sleep(0.2)
+    Board.setBuzzer(0)
+    Board.RGB.setPixelColor(1, Board.PixelColor(0, 255, 0))
+    Board.RGB.show()
+        
+    #print(reader.serial_connection.is_open)
+    #Activates shell mode
+    reader.activate_shell_mode()
+    time.sleep(1)
+    
+    uwb_is_connected = True
+    
+    while True:
+        data = reader.read_data()
+        # Get timestamp
+        timestamp = get_current_timestamp()
+
+        if data == "dwm>":
+            reader.request_lec()
+        elif data is None:
+            continue
+
+        #print("data:", data)
+        data_split = data.split(",")
+        if data_split[0] == "DIST":
+            #print("Data:", data_split)
+            # Check if 'POS' exists in the data list
+            if 'POS' in data_split:
+                # Find the index of 'POS'
+                pos_index = data_split.index('POS')
+                #print("Index:", pos_index)
+                try:
+                    # Extract position data: X, Y, Z, and quality
+                    pos_x = float(data_split[pos_index + 1])
+                    pos_y = float(data_split[pos_index + 2])
+                    pos_z = float(data_split[pos_index + 3])
+                except ValueError:
+                    pos_x = 0
+                    pos_y = 0
+                    pos_z = 0
+            else:
+                pass
+        
+        #print(f"Timestamp: {timestamp}, X: {pos_x} meters, Y: {pos_y} meters, Z: {pos_z} meters")
+        # Append the data to respective lists
+        timestamp_list.append(timestamp)
+        pos_x_list.append(pos_x)
+        pos_y_list.append(pos_y)
+        pos_z_list.append(pos_z)
+            
+##########################################################################
+def signal_handler(signum, frame):
+    global stop_requested
+    stop_requested = True
+    print("Stop requested")
+    chassis.set_velocity(0,0,0)
+##########################################################################
+def read_csv_and_loop_by_row(file_path):
+    df = pd.read_csv(file_path)
+    df.rename(columns={'x [m]': 'xs', 'y [m]': 'ys', 'z [m]': 'zs'}, inplace=True)
+    #df = calculate_angles(df)
+    
+    #Extract setpoints
+    #print(df)
+    setpoints = []
+    for index, row in df.iterrows():
+        settime = row['Time [msec]']
+        if settime % 1000 == 0:
+            setpoint = (row['Time [msec]'], row['xs'], row['ys'], row['Red'], row['Green'], row['Blue'])
+            setpoints.append(setpoint)
+    #print(setpoints)
+    
+    return df, setpoints
+##########################################################################
+def angle_between_points(p1, p2):
+    # Delta
+    delta_x = p2[0] - p1[0]
+    delta_y = p2[1] - p1[1]
+    #print(delta_x)
+    #print(delta_y)
+    
+    # Calculate the angle in radians
+    angle_rad = math.atan2(delta_y, delta_x)
+    
+    #Convert to degrees
+    angle_deg = math.degrees(angle_rad)
+    #print(angle_deg)
+    
+    return angle_deg
+##########################################################################
+def execute_movement(theta_xy, R, G, B):
+    #print("Move rover")
+    #Move rover
+    chassis.set_velocity(50, theta_xy, 0.02)
+    #print(R)
+    #print(G)
+    #print(B)
+    # Set LED color based on CSV data
+    Board.RGB.setPixelColor(0, Board.PixelColor(R, G, B))
+    Board.RGB.setPixelColor(1, Board.PixelColor(R, G, B))
+    Board.RGB.show()
+    time.sleep(0.05)
+    print("2")
+        
+##########################################################################        
+def start_movement(id_rover, wait_for_input=True):
+    global stop_requested, pos_x, pos_y, pos_z, timestamp_list, pos_x_list, pos_y_list, pos_z_list, timestamp
+    global uwb_is_connected, df
+    file_path = "Drone 1(0.3).csv"
+    df, setpoints = read_csv_and_loop_by_row(file_path)
+    #Remove setpoints at 0
+    setpoints.pop(0)
+    #print(setpoints)
+    df['timestamp'] = None
+    df['xr'] = None
+    df['yr'] = None
+    df['zr'] = None
+    df['xsr'] = None
+    df['ysr'] = None
+    df['zsr'] = None
+    df['theta_xy'] = None
+    df['dist'] = None
+    #print("df:", df)
+    # Get the number of rows in the DataFrame
+    num_rows = df.shape[0]
+    
+    df2 = pd.DataFrame(columns=['timestamp', 'xs', 'ys', 'xr' , 'yr', 'xsr', 'ysr', 'dist' , 'theta_xy' ,'Red', 'Green', 'Blue'])
+    is_moving = True       
+   
+    try:
+        while True:
+            if uwb_is_connected:
+                time.sleep(5)
+                Board.setBuzzer(1)
+                time.sleep(0.3)
+                Board.setBuzzer(0)
+                time.sleep(0.05)
+                Board.setBuzzer(1)
+                time.sleep(0.3)
+                Board.setBuzzer(0)
+                
+                #user_input = input("Press ENTER to continue...")
+                time.sleep(1)
+                '''
+                if wait_for_input:
+                    # If the client sends the wait_for_input flag, the server waits for the client’s signal.
+                    print(f"Rover {id_rover} is ready and waiting for client input to start.")
+                    return  # Don't proceed until the client sends another signal
+                '''
+                # Proceed with the movement logic after receiving the input signal from the client
+                print(f"Starting movement for Rover {id_rover}.")
+                                
+                Board.setBuzzer(1)
+                time.sleep(0.3)
+                Board.setBuzzer(0)
+                
+                xr0, yr0 = pos_x, pos_y
+                
+                #print(f"Timestamp: {timestamp}, X: {pos_x} meters, Y: {pos_y} meters, Z: {pos_z} meters")
+                #for index, row in df.iterrows():
+                while is_moving:
+                    #df.at[index, 'timestamp'] = timestamp
+                    #df.at[index, 'xr'] = pos_x
+                    #df.at[index, 'yr'] = pos_y
+                    #df.at[index, 'zr'] = pos_z
+                    #if index != (num_rows - 1):
+                    xsr = round(setpoints[0][1] + xr0, 3)
+                    ysr = round(setpoints[0][2] + yr0, 3)
+                    zsr = 0
+                    
+                    distance_to_position = round(math.sqrt((pos_x - xsr)**2 + (pos_y - ysr)**2), 3)
+                    if distance_to_position > 0.1:
+                        pass
+                    else:
+                        if len(setpoints) == 1:
+                            is_moving = False
+                            break
+                        xsr = setpoints[1][1] + xr0
+                        ysr = setpoints[1][2] + yr0
+                        setpoints.pop(0)
+                        
+                    point_1 = (pos_x, pos_y)
+                    point_2 = (xsr, ysr)
+                    #print(point_1)
+                    #print(point_2)
+                    theta_xy = round(angle_between_points(point_1, point_2), 2)
+              
+                    #Assign vars to df
+                    #df.at[index, 'xsr'] = xsr
+                    #df.at[index, 'ysr'] = ysr
+                    #df.at[index, 'zsr'] = zsr
+                    #df.at[index, 'theta_xy'] = theta_xy
+                    #df.at[index, 'dist'] = distance_to_position
+                    R, G, B = int(setpoints[0][3]), int(setpoints[0][4]), int(setpoints[0][5])
+                    
+                    #Save to dataframe
+                    datarow = (timestamp, setpoints[0][1], setpoints[0][2], pos_x, pos_y, xsr, ysr, distance_to_position, theta_xy,
+                               R, G, B)
+                    df2.loc[len(df2)] = datarow
+                    #print("R", R)
+                    execute_movement(theta_xy, R, G, B)
+                    
+                    #print(df)
+                    print(df2)
+                                        
+                break
+    except KeyboardInterrupt:
+        print("Keyboard intterupt.")
+    
+    except Exception as e:
+        print(f"Error connecting to serial port: {e}")
+        
+    finally:
+        chassis.set_velocity(0, 0, 0)   
+       
+        # Create a DataFrame from the lists
+        uwb_df = pd.DataFrame({
+            'Timestamp': timestamp_list,
+            'Pos_X': pos_x_list,
+            'Pos_Y': pos_y_list,
+            'Pos_Z': pos_z_list
+        })
+        # Optionally, save the DataFrame to a CSV file
+        uwb_df.to_csv('data_with_timestamps.csv', index=False)
+        #df.to_csv("movement_record_" + str(timestamp) + ".csv")
+        df2.to_csv("movement_record_" + str(timestamp) + ".csv")
+        
+        # Turn off all lights
+        Board.RGB.setPixelColor(0, Board.PixelColor(0, 0, 0))
+        Board.RGB.setPixelColor(1, Board.PixelColor(0, 0, 0))
+        Board.RGB.show()
+        Board.setBuzzer(0)
+        print('All lights & buzzers are turned off')
+        
+##########################################################################
+def start_rover(id_rover, wait_for_input=True):
+    Board.setBuzzer(1)
+    time.sleep(0.2)
+    Board.setBuzzer(0)
+    Board.RGB.setPixelColor(0, Board.PixelColor(0, 255, 0))
+    Board.RGB.show()
+    time.sleep(1)
+    
+    try:
+        uwb_thread = threading.Thread(target=read_uwb)
+        uwb_thread.daemon = True
+        uwb_thread.start()
+        
+    except KeyboardInterrupt:
+        print("Keyboard intterupt.")
+    
+    except Exception as e:
+        print(f"Error connecting to serial port: {e}")
+    
+    finally:
+        start_movement(id_rover, wait_for_input)
+
+##########################################################################   
+
+if __name__ == "__main__":
+    
+    start_rover(4)
+#     Board.setBuzzer(1)
+#     time.sleep(0.2)
+#     Board.setBuzzer(0)
+#     Board.RGB.setPixelColor(0, Board.PixelColor(0, 255, 0))
+#     Board.RGB.show()
+#     time.sleep(1)
+#     
+#     try:
+#         uwb_thread = threading.Thread(target=read_uwb)
+#         uwb_thread.daemon = True
+#         uwb_thread.start()
+#         
+#     except KeyboardInterrupt:
+#         print("Keyboard intterupt.")
+#     
+#     except Exception as e:
+#         print(f"Error connecting to serial port: {e}")
+#     
+#     finally:
+#         start_movement(2)

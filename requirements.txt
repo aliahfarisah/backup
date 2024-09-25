@@ -1,0 +1,9 @@
+onnx
+onnxruntime
+onnxruntime-gpu
+# pytorch
+tf2onnx
+skl2onnx
+numpy==1.21.6
+graphviz
+pygame
